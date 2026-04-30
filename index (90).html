@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>CanteenOS | ALC Meal Terminal</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        slate: { 850: '#152033' }
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'monospace']
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Google Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    
+    <!-- FontAwesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <!-- QR Code Libs -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        
+        .scanner-input { 
+            letter-spacing: 0.2em; 
+            font-weight: 800; 
+            caret-color: transparent;
+        }
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        .dark ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .dark ::-webkit-scrollbar-thumb { background: #475569; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .animate-fade-in { animation: fadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+    </style>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, query, where, getDocs, updateDoc, doc, onSnapshot, serverTimestamp, setDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // ============================================================
+        //  FIREBASE CONFIGURATION
+        // ============================================================
+        let firebaseConfig = {
+            apiKey: "AIzaSyAfKp8gWavPxo5EZafetpeADh7eeRHQQx0",
+            authDomain: "canteen-2d80d.firebaseapp.com",
+            projectId: "canteen-2d80d",
+            storageBucket: "canteen-2d80d.firebasestorage.app",
+            messagingSenderId: "835222412943",
+            appId: "1:835222412943:web:8db25547c45a1f0e1d5afa"
+        };
+        
+        if (typeof __firebase_config !== 'undefined' && __firebase_config) { 
+            try {
+                firebaseConfig = typeof __firebase_config === 'string' ? JSON.parse(__firebase_config) : __firebase_config;
+            } catch (e) {
+                console.warn("Could not parse __firebase_config", e);
+            }
+        }
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        
+        const appId = (typeof __app_id !== 'undefined') ? __app_id : 'canteen-os-live';
+
+        // --- Data Handling ---
+        let EMPLOYEES = {};
+        let SYSTEM_USERS = {}; 
+        let TODAY_TOKENS = new Set(); // FAST LOOKUP CACHE
+        let RAW_TODAY_TOKENS = []; // Store full objects for UI filtering
+        let WEEKLY_PRICES = { Monday: 80, Tuesday: 80, Wednesday: 80, Thursday: 80, Friday: 80, Saturday: 80, Sunday: 80 };
+        let alcMealItems = {}; // ALC Meals
+        
+        let html5QrcodeScanner = null;
+        let scanDebounceTimer = null;
+        let resultModalTimer = null;
+
+        // --- State ---
+        let currentUser = null; 
+        let loggedInSysUser = null; 
+        let dataLoaded = false;
+        const SYS_SESSION_KEY = `canteen_sys_session_${appId}`;
+
+        // Auto Logout Timer
+        let idleTime = 0;
+        const MAX_IDLE_TIME = 120; // 120 Seconds
+
+        const views = {
+            login: document.getElementById('view-login'), 
+            security: document.getElementById('view-security'),
+            loading: document.getElementById('view-loading')
+        };
+        const navBar = document.getElementById('main-nav');
+        const roleDisplay = document.getElementById('role-display');
+        
+        // --- Theme Init ---
+        window.initTheme = () => {
+            const savedTheme = localStorage.getItem('canteen_theme');
+            if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                document.documentElement.classList.add('dark');
+            } else {
+                document.documentElement.classList.remove('dark');
+            }
+            window.updateThemeIcon = () => {
+                const btn = document.getElementById('theme-toggle-btn');
+                if (!btn) return;
+                if (document.documentElement.classList.contains('dark')) {
+                    btn.innerHTML = '<i class="fas fa-sun text-yellow-400"></i>';
+                } else {
+                    btn.innerHTML = '<i class="fas fa-moon text-slate-300"></i>';
+                }
+            };
+            window.updateThemeIcon();
+        };
+
+        window.toggleTheme = () => {
+            document.documentElement.classList.toggle('dark');
+            const isDark = document.documentElement.classList.contains('dark');
+            localStorage.setItem('canteen_theme', isDark ? 'dark' : 'light');
+            window.updateThemeIcon();
+        };
+
+        initTheme();
+
+        // --- Auth & Data Init ---
+        const initAuth = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (err) {
+                console.error("Auth Error:", err);
+                const loadingView = document.getElementById('view-loading');
+                if(loadingView) loadingView.innerHTML = `<div class="text-red-500 font-bold p-4">Connection Error: ${err.message}</div>`;
+            }
+        };
+
+        const loadData = () => {
+            if (!auth.currentUser) return;
+
+            // 1. Load Employees
+            onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'employees')), (snapshot) => {
+                snapshot.forEach(doc => EMPLOYEES[doc.id] = doc.data());
+            }, (err) => console.error("Emp fetch err", err));
+
+            // 2. Load System Users for Login
+            onSnapshot(query(collection(db, 'artifacts', appId, 'public', 'data', 'system_users')), (snapshot) => {
+                snapshot.forEach(doc => SYSTEM_USERS[doc.id] = doc.data());
+                if (!dataLoaded) {
+                    dataLoaded = true;
+                    checkAuthRouting();
+                }
+            }, (err) => console.error("Sys users fetch err", err));
+
+            // 3. Load General Prices
+            onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'settings', 'meal_prices'), (docSnap) => {
+                if (docSnap.exists() && docSnap.data().prices) {
+                    WEEKLY_PRICES = { ...WEEKLY_PRICES, ...docSnap.data().prices };
+                }
+            }, (err) => console.error("Prices fetch err", err));
+
+            // 4. Fetch ALC Settings specifically
+            onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'system_settings', 'canteen'), (docSnap) => {
+                if (docSnap.exists() && docSnap.data().alcMealItems) {
+                    alcMealItems = docSnap.data().alcMealItems;
+                    updateAlcDropdown();
+                }
+            }, (err) => console.error("ALC settings fetch error:", err));
+
+            // 5. Load TODAY'S TOKENS
+            const todayStr = getTodayStr();
+            const tokenQuery = query(collection(db, 'artifacts', appId, 'public', 'data', 'tokens'), where('issuedDate', '==', todayStr));
+            
+            onSnapshot(tokenQuery, (snapshot) => {
+                TODAY_TOKENS.clear(); 
+                RAW_TODAY_TOKENS = []; 
+                
+                snapshot.forEach(doc => {
+                    const data = doc.data();
+                    TODAY_TOKENS.add(data.empId); 
+                    RAW_TODAY_TOKENS.push({ id: doc.id, ...data });
+                });
+
+                if (!views.security.classList.contains('hidden')) {
+                    updateRecentList();
+                }
+            }, (err) => console.error("Tokens fetch err", err));
+        };
+
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                currentUser = user;
+                if (!dataLoaded) loadData();
+            } else {
+                showView('loading');
+            }
+        });
+
+        initAuth();
+
+        function updateAlcDropdown() {
+            const select = document.getElementById('alc-meal-select');
+            if (!select) return;
+            select.innerHTML = '<option value="" disabled selected>-- Select ALC Meal Variety --</option>';
+            Object.entries(alcMealItems).sort((a, b) => a[0].localeCompare(b[0])).forEach(([name, cost]) => {
+                select.innerHTML += `<option value="${name}">${name} (LKR ${parseFloat(cost).toFixed(2)})</option>`;
+            });
+        }
+
+        // --- ALC UI Mode Handling ---
+        window.handleAlcSelection = () => {
+            const val = document.getElementById('alc-meal-select').value;
+            const scannerWrapper = document.getElementById('scanner-wrapper');
+            const placeholder = document.getElementById('scanner-placeholder');
+            
+            if (val) {
+                scannerWrapper.classList.remove('hidden');
+                placeholder.classList.add('hidden');
+                setTimeout(() => document.getElementById('sec-emp-id').focus(), 100);
+            } else {
+                scannerWrapper.classList.add('hidden');
+                placeholder.classList.remove('hidden');
+            }
+        };
+
+        // --- IDLE TIMER ---
+        setInterval(() => {
+            if(loggedInSysUser) {
+                idleTime++;
+                if (idleTime >= MAX_IDLE_TIME) appLogout(true);
+            }
+        }, 1000);
+
+        const resetIdleTimer = () => { idleTime = 0; };
+        document.onmousemove = resetIdleTimer;
+        document.onkeypress = resetIdleTimer;
+        document.onclick = resetIdleTimer;
+        document.ontouchstart = resetIdleTimer;
+
+        // ============================================================
+        //  LOGIN & ROUTING
+        // ============================================================
+        
+        function checkAuthRouting() {
+            const sessionStr = localStorage.getItem(SYS_SESSION_KEY);
+            if (sessionStr) {
+                const session = JSON.parse(sessionStr);
+                const sysUser = SYSTEM_USERS[session.username];
+                
+                // Master Admin
+                if (session.username === 'ADMIN' && session.date === getTodayStr()) {
+                    loggedInSysUser = { username: 'ADMIN', name: 'System Admin', role: 'ADMIN', status: 'ACTIVE' };
+                    proceedToApp();
+                    return;
+                }
+
+                // Verify User and Role (Allow SECURITY and ADMIN only)
+                if (session.date === getTodayStr() && sysUser && sysUser.status === 'ACTIVE') {
+                    if (sysUser.role === 'SECURITY' || sysUser.role === 'ADMIN') {
+                        loggedInSysUser = sysUser;
+                        proceedToApp();
+                        return;
+                    }
+                }
+            }
+            showView('login');
+            navBar.classList.add('hidden');
+        }
+
+        window.appLogin = async (e) => {
+            e.preventDefault();
+            const u = document.getElementById('login-username').value.trim().toUpperCase();
+            const p = document.getElementById('login-pin').value.trim();
+            const errEl = document.getElementById('login-error');
+            
+            // Master Admin
+            if (u === 'ADMIN' && p === 'ADMIN123') {
+                loggedInSysUser = { username: 'ADMIN', name: 'System Admin', role: 'ADMIN', status: 'ACTIVE' };
+                localStorage.setItem(SYS_SESSION_KEY, JSON.stringify({ username: 'ADMIN', date: getTodayStr() }));
+                errEl.classList.add('hidden');
+                proceedToApp();
+                return;
+            }
+
+            const user = SYSTEM_USERS[u];
+            if (user && user.pin === p && user.status === 'ACTIVE') {
+                if (user.role === 'SECURITY' || user.role === 'ADMIN') {
+                    loggedInSysUser = user;
+                    localStorage.setItem(SYS_SESSION_KEY, JSON.stringify({ username: u, date: getTodayStr() }));
+                    errEl.classList.add('hidden');
+                    proceedToApp();
+                } else {
+                    errEl.textContent = "Access Denied: Invalid Role for Security Desk";
+                    errEl.classList.remove('hidden');
+                }
+            } else {
+                errEl.textContent = "Access Denied: Invalid Credentials";
+                errEl.classList.remove('hidden');
+            }
+        };
+
+        window.appLogout = (auto = false) => {
+            localStorage.removeItem(SYS_SESSION_KEY);
+            loggedInSysUser = null;
+            if(auto) window.location.reload(); 
+            else checkAuthRouting();
+        };
+
+        function proceedToApp() {
+            showView('security');
+            navBar.classList.remove('hidden');
+            roleDisplay.textContent = `${loggedInSysUser.name} (${loggedInSysUser.role})`;
+            
+            updateRecentList();
+            
+            // Scanner is hidden by default until ALC meal is selected, 
+            // so we don't focus immediately upon login unless it's unhidden.
+        }
+
+        function showView(viewName) {
+            Object.values(views).forEach(el => el && el.classList.add('hidden'));
+            if(views[viewName]) views[viewName].classList.remove('hidden');
+        }
+
+        function getTodayStr() { return new Date().toISOString().split('T')[0]; }
+
+        function showToast(message, type = 'info') {
+            const toast = document.getElementById('toast');
+            document.getElementById('toast-message').textContent = message;
+            const icon = document.getElementById('toast-icon');
+            toast.className = `fixed bottom-4 right-4 px-6 py-4 rounded-xl shadow-2xl transition-all duration-300 z-[100] flex items-center space-x-3 font-medium ${type === 'error' ? 'bg-red-600 text-white' : type === 'success' ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-white'}`;
+            icon.className = `fas text-xl ${type === 'error' ? 'fa-exclamation-circle' : type === 'success' ? 'fa-check-circle' : 'fa-info-circle'}`;
+            toast.classList.remove('translate-y-20', 'opacity-0');
+            setTimeout(() => toast.classList.add('translate-y-20', 'opacity-0'), 3000);
+        }
+
+        // --- SCANNING LOGIC ---
+        window.executeScan = (val) => {
+            if (!val) return;
+            showScanResultModal('VERIFYING...', 'Processing...', 'info');
+            setTimeout(() => processSecurityScan(val), 50);
+        };
+
+        window.handleScannerInput = (event) => {
+            if (event.key === 'Enter') {
+                if(scanDebounceTimer) clearTimeout(scanDebounceTimer);
+                executeScan(event.target.value.trim().toUpperCase());
+                event.target.value = ''; 
+                event.target.focus();
+            }
+        };
+
+        window.handleAutoScan = (event) => {
+            if(scanDebounceTimer) clearTimeout(scanDebounceTimer);
+            scanDebounceTimer = setTimeout(() => {
+                const val = event.target.value.trim().toUpperCase();
+                if (val.length >= 2) {
+                    executeScan(val);
+                    event.target.value = ''; event.target.focus();
+                }
+            }, 10);
+        };
+
+        window.keepFocus = () => {
+            const modal = document.getElementById('result-modal');
+            const wrapper = document.getElementById('scanner-wrapper');
+            
+            // Only force focus if the scanner wrapper is visible and the modal is hidden
+            if (modal.classList.contains('hidden') && !wrapper.classList.contains('hidden')) {
+                setTimeout(() => {
+                    const el = document.getElementById('sec-emp-id');
+                    if(el && document.activeElement !== el) el.focus();
+                }, 100);
+            }
+        };
+
+        // --- CORE ALC SECURITY LOGIC ---
+        async function processSecurityScan(empId) {
+            const emp = EMPLOYEES[empId];
+            if(!emp) return showScanResultModal('ACCESS DENIED', 'Invalid Terminal ID', 'error');
+
+            // 1. Enforce ALC Employee Only
+            const site = emp.site ? emp.site.toUpperCase() : '';
+            const company = String(emp.companyName || emp.company || '').toUpperCase();
+            
+            if (site !== 'ALC' && !company.includes('ALC')) {
+                return showScanResultModal('RESTRICTED ACCESS', `Not an ALC Employee. Standard personnel are not authorized for ALC assignments.`, 'error', emp.photoData);
+            }
+
+            // 2. Enforce ALC Meal Selection
+            const mealName = document.getElementById('alc-meal-select')?.value;
+            if (!mealName) return showScanResultModal('MISSING SELECTION', 'Please select an ALC meal variety from the dropdown.', 'warning');
+            
+            // 3. Check for Duplicate
+            if (TODAY_TOKENS.has(emp.id)) {
+                return showScanResultModal('ALREADY ACTIVE', `${emp.name} has already accessed today.`, 'warning', emp.photoData);
+            }
+
+            const appliedCost = parseFloat(alcMealItems[mealName]) || 0;
+
+            // 4. APPROVED - Optimistic UI
+            showScanResultModal('ENTRY APPROVED', `${emp.name}\nAssigned: ${mealName}`, 'success', emp.photoData);
+
+            const todayStr = getTodayStr();
+
+            try {
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'tokens'), {
+                    tokenString: `TKN-${Math.floor(Math.random()*10000)}`,
+                    empId: emp.id,
+                    empName: emp.name,
+                    dept: emp.dept || '',
+                    company: emp.companyName || '',
+                    account: emp.accountName || '',
+                    site: emp.site || '-',
+                    issuedDate: todayStr,
+                    date: todayStr,
+                    status: 'ISSUED',
+                    mealRedeemed: false,
+                    issuedAt: serverTimestamp(),
+                    markedAt: serverTimestamp(),
+                    issuedBy: currentUser.uid,
+                    issuedBySysUser: loggedInSysUser.username,
+                    markedBy: loggedInSysUser.username,
+                    mealName: mealName,
+                    costApplied: appliedCost,
+                    costs: { total: appliedCost }
+                });
+                
+                // Reset Selection to force next person to select intentionally
+                document.getElementById('alc-meal-select').value = "";
+                handleAlcSelection(); // This will re-hide the scanner wrapper
+
+            } catch (e) { 
+                console.error(e); 
+                showToast("System Error saving data", "error"); 
+            }
+        }
+
+        // Render List function (Live Feed)
+        function updateRecentList() {
+            const list = document.getElementById('sec-recent-list');
+            if (!list) return;
+            
+            let myTokens = [];
+            
+            if (loggedInSysUser && RAW_TODAY_TOKENS.length > 0) {
+                myTokens = RAW_TODAY_TOKENS.filter(t => t.issuedBySysUser === loggedInSysUser.username);
+            }
+
+            list.innerHTML = '';
+            document.getElementById('sec-today-count').textContent = myTokens.length;
+
+            myTokens.sort((a, b) => {
+                const tA = a.issuedAt ? a.issuedAt.seconds : 0;
+                const tB = b.issuedAt ? b.issuedAt.seconds : 0;
+                return tB - tA;
+            });
+
+            myTokens.slice(0, 50).forEach(data => {
+                const el = document.createElement('div');
+                el.className = 'flex justify-between items-center p-4 border-b border-slate-100 dark:border-slate-700/50 last:border-0 hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors rounded-xl animate-fade-in';
+                
+                const empPhoto = EMPLOYEES[data.empId]?.photoData;
+                const avatarHtml = empPhoto 
+                    ? `<img src="${empPhoto}" class="h-10 w-10 rounded-full object-cover mr-4 border border-slate-200 dark:border-slate-600 shadow-sm">`
+                    : `<div class="h-10 w-10 rounded-full bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 flex items-center justify-center font-bold text-sm mr-4 shadow-sm">${(data.empName || '?').charAt(0)}</div>`;
+
+                const timeStr = data.issuedAt ? new Date(data.issuedAt.seconds*1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : 'Just now';
+                
+                // Include ALC Meal Selection Tag
+                const mealLabel = data.mealName ? `<span class="text-[9px] uppercase font-bold text-indigo-500 tracking-wider bg-indigo-500/10 px-2 py-0.5 rounded ml-2 border border-indigo-500/20">${data.mealName}</span>` : '';
+
+                el.innerHTML = `
+                    <div class="flex items-center">
+                        ${avatarHtml}
+                        <div>
+                            <div class="font-bold text-slate-800 dark:text-white text-sm">${data.empName}</div>
+                            <div class="text-xs text-slate-500 dark:text-slate-400 font-medium flex items-center mt-0.5">
+                                ${data.dept || '-'} | ${data.site || '-'} ${mealLabel}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="text-right">
+                        <span class="text-[10px] font-bold px-2.5 py-1 rounded-full ${data.status==='ISSUED'?'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300':'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300'} uppercase tracking-wide">${data.status}</span>
+                        <div class="text-[10px] text-slate-400 dark:text-slate-500 mt-1.5 font-medium">${timeStr}</div>
+                    </div>
+                `;
+                list.appendChild(el);
+            });
+        }
+
+        // --- Camera & UI ---
+        window.startWebcamScanner = () => {
+            document.getElementById('webcam-modal').classList.remove('hidden');
+            if (!html5QrcodeScanner) html5QrcodeScanner = new Html5Qrcode("reader");
+            html5QrcodeScanner.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } },
+                (decodedText) => { stopWebcamScanner(); executeScan(decodedText.trim().toUpperCase()); },
+                () => {}
+            ).catch(err => { showToast("Camera Error", "error"); document.getElementById('webcam-modal').classList.add('hidden'); });
+        };
+        window.stopWebcamScanner = () => {
+            document.getElementById('webcam-modal').classList.add('hidden');
+            if(html5QrcodeScanner) html5QrcodeScanner.stop().catch(()=>{});
+            setTimeout(() => { document.getElementById('sec-emp-id').focus(); }, 200);
+        };
+
+        window.closeResultModal = () => {
+            if(resultModalTimer) clearTimeout(resultModalTimer);
+            document.getElementById('result-modal').classList.add('hidden');
+            
+            // Only focus if the scanner wrapper is visible
+            if (!document.getElementById('scanner-wrapper').classList.contains('hidden')) {
+                document.getElementById('sec-emp-id').focus();
+            }
+        }
+
+        window.showScanResultModal = (title, message, type, photoDataStr = null) => {
+            const modal = document.getElementById('result-modal');
+            const iconEl = document.getElementById('res-icon');
+            const bgEl = document.getElementById('res-bg');
+            document.getElementById('res-title').textContent = title;
+            document.getElementById('res-msg').textContent = message;
+            
+            const photoEl = document.getElementById('res-photo');
+            if (photoDataStr) {
+                photoEl.src = photoDataStr;
+                photoEl.classList.remove('hidden');
+                iconEl.classList.add('hidden');
+            } else {
+                photoEl.classList.add('hidden');
+                iconEl.classList.remove('hidden');
+                if (type === 'success') { iconEl.className = "fas fa-check-circle text-6xl text-white mb-4 drop-shadow-md"; }
+                else if (type === 'error') { iconEl.className = "fas fa-times-circle text-6xl text-white mb-4 drop-shadow-md"; }
+                else { iconEl.className = "fas fa-exclamation-circle text-6xl text-white mb-4 drop-shadow-md animate-pulse"; }
+            }
+            
+            modal.classList.remove('hidden');
+            if (type === 'success') bgEl.className = "bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-t-3xl p-8 text-center relative overflow-hidden";
+            else if (type === 'error') bgEl.className = "bg-gradient-to-br from-red-500 to-red-600 rounded-t-3xl p-8 text-center relative overflow-hidden";
+            else bgEl.className = "bg-gradient-to-br from-blue-500 to-blue-600 rounded-t-3xl p-8 text-center relative overflow-hidden";
+            
+            if (resultModalTimer) clearTimeout(resultModalTimer);
+            if(title !== 'VERIFYING...') {
+                resultModalTimer = setTimeout(closeResultModal, 4000);
+            }
+        };
+    </script>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 font-sans min-h-screen flex flex-col transition-colors duration-500">
+
+    <!-- Navbar -->
+    <nav id="main-nav" class="bg-[#0f172a] dark:bg-[#020617] text-white shadow-xl hidden sticky top-0 z-40 border-b border-slate-800">
+        <div class="container mx-auto px-6 py-3.5 flex justify-between items-center">
+            <div class="flex items-center gap-4">
+                <div class="bg-indigo-600 rounded-lg w-8 h-8 flex items-center justify-center shadow-[0_0_10px_rgba(79,70,229,0.4)]">
+                    <i class="fas fa-fish text-white text-sm"></i>
+                </div>
+                <span class="font-extrabold text-xl tracking-tight text-white">ALC<span class="text-indigo-400">Assign</span></span>
+            </div>
+            <div class="flex items-center gap-5">
+                <button id="theme-toggle-btn" onclick="toggleTheme()" class="w-8 h-8 flex items-center justify-center rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors border border-slate-700">
+                    <i class="fas fa-moon"></i>
+                </button>
+                <div id="role-display" class="hidden sm:block text-[10px] font-bold uppercase bg-slate-800/50 border border-slate-700 px-3 py-1.5 rounded-lg text-slate-300 tracking-wider">TERMINAL</div>
+                <button onclick="appLogout()" class="text-xs bg-slate-800 hover:bg-red-600 border border-slate-700 hover:border-red-500 text-white px-4 py-2 rounded-lg font-bold transition-all duration-300 flex items-center"><i class="fas fa-power-off mr-2"></i> Exit</button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="flex-grow container mx-auto px-4 py-8">
+        
+        <!-- Loading -->
+        <div id="view-loading" class="fixed inset-0 z-[60] bg-[#0f172a] flex flex-col items-center justify-center">
+            <div class="relative flex items-center justify-center">
+                <div class="absolute animate-ping inline-flex h-16 w-16 rounded-full bg-indigo-400 opacity-20"></div>
+                <div class="relative inline-flex rounded-full h-8 w-8 bg-indigo-500 shadow-[0_0_20px_rgba(99,102,241,0.6)]"></div>
+            </div>
+            <div class="mt-8 text-center space-y-2">
+                <h2 class="text-white font-bold text-xl tracking-tight">ALC<span class="text-indigo-500">Terminal</span></h2>
+                <p class="text-slate-400 text-xs uppercase tracking-[0.2em] font-medium">Establishing Connection</p>
+            </div>
+        </div>
+
+        <!-- Login Portal -->
+        <div id="view-login" class="fixed inset-0 z-50 bg-[#0B1120] hidden flex flex-col items-center justify-center animate-fade-in" style="background-image: linear-gradient(rgba(11, 17, 32, 0.85), rgba(11, 17, 32, 0.95)), url('https://i.ibb.co/Q31BytM7/AZp-Hxf-Rl-RQtf34v3-Jc5i-EA-AZp-Hxf-Rl-Ws-x-Ty3-Xyxd-CMA.jpg'); background-size: cover; background-position: center;">
+            <div class="w-full max-w-md mx-auto relative px-4">
+                <div class="bg-[#131B2B]/90 backdrop-blur-xl border border-[#1F2937] rounded-[2rem] p-10 shadow-2xl relative z-10 overflow-hidden">
+                    <div class="text-center mb-10 relative z-20">
+                        <div class="inline-flex items-center justify-center w-14 h-14 bg-indigo-600 rounded-xl mb-4 shadow-lg shadow-indigo-600/30">
+                            <i class="fas fa-shield-alt text-2xl text-white"></i>
+                        </div>
+                        <h2 class="text-2xl font-extrabold text-white mb-2">ALC Access</h2>
+                        <p class="text-[10px] text-slate-400 uppercase tracking-widest font-semibold">Authorized Personnel Only</p>
+                    </div>
+                    <form onsubmit="appLogin(event)" class="space-y-6 relative z-20">
+                        <div>
+                            <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-1">Terminal ID</label>
+                            <input type="text" id="login-username" class="w-full px-4 py-3 border border-[#1F2937] rounded-xl bg-[#0B1120]/80 text-sm text-slate-200 focus:border-[#4F46E5] focus:ring-1 focus:ring-[#4F46E5] outline-none transition uppercase" required placeholder="E.G. ALC-01">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2 ml-1">Access PIN</label>
+                            <input type="password" id="login-pin" class="w-full px-4 py-3 border border-[#1F2937] rounded-xl bg-[#0B1120]/80 text-sm text-slate-200 focus:border-[#4F46E5] focus:ring-1 focus:ring-[#4F46E5] outline-none transition tracking-widest" required placeholder="••••••••">
+                        </div>
+                        <div id="login-error" class="hidden text-red-400 text-xs text-center font-bold bg-red-500/10 py-3 rounded-lg border border-red-500/20"><i class="fas fa-shield-alt mr-2"></i> Access Denied</div>
+                        <div class="pt-4">
+                            <button type="submit" class="w-full bg-[#4F46E5] hover:bg-[#4338CA] text-white font-bold py-3.5 rounded-xl shadow-[0_0_20px_rgba(79,70,229,0.4)] transition-all transform active:scale-[0.98] text-sm">Initialize Terminal</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            <div class="w-full text-center pb-8 pt-4 relative z-20 text-[10px] text-slate-500 font-bold uppercase tracking-widest">
+                CanteenOS ALC Assignment Module
+            </div>
+        </div>
+
+        <!-- Security Dashboard -->
+        <div id="view-security" class="hidden max-w-6xl mx-auto animate-fade-in relative">
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 items-start">
+                
+                <!-- Scanner Section -->
+                <div class="bg-white dark:bg-slate-800 rounded-3xl shadow-lg border border-slate-100 dark:border-slate-700 overflow-hidden">
+                    <div class="bg-gradient-to-r from-indigo-600 to-indigo-800 p-8 text-center text-white relative overflow-hidden">
+                        <i class="fas fa-fish text-6xl mb-3 opacity-20 absolute -right-4 -bottom-4 transform rotate-12"></i>
+                        <h2 class="text-2xl font-extrabold relative z-10 tracking-tight">ALC Meal Assign</h2>
+                        <p class="text-indigo-200 text-xs font-medium mt-1">Select Meal & Scan ALC ID</p>
+                    </div>
+                    <div class="p-8 lg:p-10 flex flex-col items-center bg-slate-50 dark:bg-slate-900/50 min-h-[300px] justify-center relative">
+                        
+                        <!-- ALC Selection Dropdown -->
+                        <div id="alc-dropdown-container" class="w-full mb-6 relative z-10">
+                            <div class="relative">
+                                <select id="alc-meal-select" class="w-full border-2 border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 rounded-2xl px-5 py-4 text-slate-800 dark:text-slate-200 focus:ring-4 focus:ring-indigo-500/20 focus:border-indigo-500 outline-none transition font-bold appearance-none cursor-pointer shadow-inner" onchange="handleAlcSelection()">
+                                    <option value="" disabled selected>-- Select ALC Meal Variety --</option>
+                                </select>
+                                <div class="absolute right-5 top-5 pointer-events-none text-slate-400"><i class="fas fa-chevron-down"></i></div>
+                            </div>
+                        </div>
+
+                        <!-- Scanner Input Wrapper (Hidden by default until ALC selected) -->
+                        <div id="scanner-wrapper" class="w-full flex flex-col items-center hidden animate-fade-in relative z-10">
+                            <div class="w-full relative mb-6">
+                                <div class="absolute inset-y-0 left-6 flex items-center pointer-events-none text-indigo-400 text-xl"><i class="fas fa-barcode"></i></div>
+                                <input type="password" id="sec-emp-id" inputmode="none" placeholder="SCAN ALC ID" class="w-full pl-16 pr-6 py-6 border-2 border-indigo-400/60 dark:border-indigo-600 rounded-2xl bg-white dark:bg-slate-900 focus:bg-white dark:focus:bg-slate-800 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/20 font-mono text-center text-3xl outline-none transition scanner-input shadow-inner text-slate-800 dark:text-white" onkeydown="handleScannerInput(event)" oninput="handleAutoScan(event)" onblur="keepFocus()" autocomplete="off">
+                            </div>
+                            <button onclick="startWebcamScanner()" class="w-full flex justify-center items-center text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 font-bold text-sm bg-indigo-50 dark:bg-indigo-900/30 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 border border-indigo-200 dark:border-indigo-800 px-6 py-4 rounded-xl transition shadow-sm"><i class="fas fa-camera mr-2"></i> Activate Camera</button>
+                        </div>
+                        
+                        <!-- Placeholder text shown when scanner is hidden -->
+                        <div id="scanner-placeholder" class="text-center py-6 animate-fade-in text-slate-400 dark:text-slate-500">
+                            <i class="fas fa-hand-pointer text-4xl mb-3 opacity-50"></i>
+                            <p class="text-sm font-bold">Awaiting meal selection to activate scanner.</p>
+                        </div>
+
+                    </div>
+                </div>
+
+                <!-- Live Feed Section -->
+                <div class="bg-white dark:bg-slate-800 rounded-3xl shadow-sm border border-slate-200 dark:border-slate-700 p-8 h-full min-h-[500px] flex flex-col relative">
+                    <div class="flex justify-between items-center mb-6 border-b border-slate-100 dark:border-slate-700/50 pb-3">
+                        <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest flex items-center"><i class="fas fa-history mr-2"></i> Live Assign Feed</h3>
+                        <div class="bg-indigo-50 dark:bg-indigo-900/30 px-4 py-2 rounded-lg border border-indigo-100 dark:border-indigo-800">
+                            <span class="text-[10px] font-bold text-indigo-400 uppercase tracking-wider block">Assigned Today</span>
+                            <span id="sec-today-count" class="text-xl font-black text-indigo-600 dark:text-indigo-400">0</span>
+                        </div>
+                    </div>
+                    <div id="sec-recent-list" class="space-y-3 overflow-y-auto flex-grow pr-2 h-[400px]"></div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Result Modal -->
+    <div id="result-modal" class="fixed inset-0 hidden z-[80] flex items-end sm:items-center justify-center pointer-events-auto p-4 backdrop-blur-sm bg-slate-900/20">
+        <div class="bg-white dark:bg-slate-800 w-full max-w-sm rounded-3xl shadow-2xl transform transition-all scale-100 overflow-hidden border border-slate-100 dark:border-slate-700 relative">
+            
+            <!-- Close Button -->
+            <button onclick="closeResultModal()" class="absolute top-4 right-4 z-20 w-8 h-8 flex items-center justify-center bg-black/20 hover:bg-black/40 text-white rounded-full transition-colors backdrop-blur-md">
+                <i class="fas fa-times text-sm"></i>
+            </button>
+
+            <div id="res-bg" class="rounded-t-3xl p-8 text-center flex flex-col items-center">
+                <i id="res-icon" class="text-6xl text-white mb-4 drop-shadow-md"></i>
+                <img id="res-photo" class="h-28 w-28 rounded-2xl object-cover border-4 border-white dark:border-slate-700 mb-5 shadow-lg hidden" src="">
+                <h2 id="res-title" class="text-2xl font-black text-white tracking-tight drop-shadow-sm"></h2>
+            </div>
+            <div class="p-8 text-center bg-slate-50 dark:bg-slate-900/50">
+                <p id="res-msg" class="text-slate-800 dark:text-white font-bold text-xl leading-relaxed whitespace-pre-line"></p>
+                <button onclick="closeResultModal()" class="mt-6 w-full py-3 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-600 text-slate-500 dark:text-slate-400 font-bold rounded-xl text-sm hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors uppercase tracking-wider">Acknowledge</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Webcam Modal -->
+    <div id="webcam-modal" class="fixed inset-0 bg-[#0B1120]/95 hidden z-[90] flex flex-col items-center justify-center p-4 backdrop-blur-sm">
+        <div class="bg-[#131B2B] rounded-3xl overflow-hidden w-full max-w-md relative shadow-2xl border border-slate-800">
+            <div class="bg-[#1F2937] text-white p-5 flex justify-between items-center border-b border-slate-700"><span class="font-bold flex items-center text-sm uppercase tracking-wider"><i class="fas fa-video mr-3 text-indigo-500"></i> Scanning</span><button onclick="stopWebcamScanner()" class="text-slate-400 hover:text-white bg-slate-800 hover:bg-red-500 rounded-lg p-2 transition"><i class="fas fa-times"></i></button></div>
+            <div id="reader" class="w-full bg-[#0B1120] min-h-[350px]"></div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="fixed bottom-6 right-6 translate-y-20 opacity-0 transition-all duration-300 z-[100]"><div class="flex items-center space-x-3 px-6 py-4 rounded-xl shadow-2xl font-medium border border-white/10"><i id="toast-icon" class="fas text-xl"></i><span id="toast-message"></span></div></div>
+
+</body>
+</html>
